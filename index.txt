@@ -1,0 +1,314 @@
+#include <WiFi.h>
+#include <ThingSpeak.h>
+#include <TinyGPS++.h>
+#include <HardwareSerial.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+
+#define MODEM_PWRKEY 4
+#define MODEM_POWER_ON 23
+#define MODEM_TX 27
+#define MODEM_RX 26
+
+#define GPS_TX 32
+#define GPS_RX 33
+
+#define SOS_BUTTON 14
+
+TinyGPSPlus gps;
+
+HardwareSerial GSM(1);
+HardwareSerial gpsSerial(2);
+
+/* WiFi Credentials */
+const char* ssid = "WIFI_NAME";
+const char* password = "WIFI_PASSWORD";
+
+/* ThingSpeak Credentials */
+unsigned long channelID = CHANNEL_ID;
+const char* writeAPIKey = "WRITE_API_KEY";
+
+WiFiClient client;
+
+/* Phone Numbers */
+const char* phoneNumbers[] = {
+"+91XXXXXXXXXX",
+"+91XXXXXXXXXX",
+"+91XXXXXXXXXX"
+};
+
+int totalNumbers = 3;
+
+unsigned long gpsInterval = 30000;
+unsigned long lastGPSUpdate = 0;
+
+bool firstSMSsent = false;
+
+float lat = 0;
+float lng = 0;
+
+String address = "Address not available";
+
+float lastLat = 0;
+float lastLng = 0;
+
+float movementThreshold = 0.0005;
+
+unsigned long lastButtonPress = 0;
+
+bool isGPSReady()
+{
+  if (!gps.location.isValid()) return false;
+  if (gps.location.lat() == 0.0 || gps.location.lng() == 0.0) return false;
+  if (gps.satellites.value() < 4) return false;
+  return true;
+}
+
+bool hasMoved()
+{
+  float latDiff = abs(lat - lastLat);
+  float lngDiff = abs(lng - lastLng);
+
+  if(latDiff > movementThreshold || lngDiff > movementThreshold)
+  {
+    lastLat = lat;
+    lastLng = lng;
+    return true;
+  }
+  return false;
+}
+
+void setup()
+{
+  Serial.begin(115200);
+
+  pinMode(SOS_BUTTON, INPUT_PULLUP);
+
+  gpsSerial.begin(9600, SERIAL_8N1, GPS_TX, GPS_RX);
+
+  pinMode(MODEM_PWRKEY, OUTPUT);
+  pinMode(MODEM_POWER_ON, OUTPUT);
+
+  digitalWrite(MODEM_POWER_ON, HIGH);
+  delay(100);
+
+  digitalWrite(MODEM_PWRKEY, LOW);
+  delay(1000);
+  digitalWrite(MODEM_PWRKEY, HIGH);
+  delay(3000);
+
+  GSM.begin(9600, SERIAL_8N1, MODEM_RX, MODEM_TX);
+
+  Serial.println("GSM Started");
+
+  WiFi.begin(ssid, password);
+
+  Serial.println("Connecting WiFi");
+
+  while (WiFi.status() != WL_CONNECTED)
+  {
+    delay(500);
+    Serial.print(".");
+  }
+
+  Serial.println();
+  Serial.println("WiFi Connected");
+
+  ThingSpeak.begin(client);
+}
+
+void loop()
+{
+  while (gpsSerial.available())
+  {
+    gps.encode(gpsSerial.read());
+  }
+
+  /* SOS BUTTON DETECTION */
+  if (digitalRead(SOS_BUTTON) == LOW)
+  {
+    delay(50);
+
+    if (digitalRead(SOS_BUTTON) == LOW && millis() - lastButtonPress > 5000)
+    {
+      Serial.println("SOS BUTTON PRESSED");
+
+      sendEmergencySMS();
+
+      lastButtonPress = millis();
+
+      while(digitalRead(SOS_BUTTON) == LOW)
+      {
+        delay(10);
+      }
+    }
+  }
+
+  if (millis() - lastGPSUpdate > gpsInterval && isGPSReady())
+  {
+    lat = gps.location.lat();
+    lng = gps.location.lng();
+
+    Serial.println("GPS Updated");
+
+    Serial.print("Latitude: ");
+    Serial.println(lat,6);
+
+    Serial.print("Longitude: ");
+    Serial.println(lng,6);
+
+    Serial.print("Satellites: ");
+    Serial.println(gps.satellites.value());
+
+    Serial.println("--------------------");
+
+    uploadThingSpeak();
+
+    getAddress();
+
+    lastGPSUpdate = millis();
+
+    if (!firstSMSsent)
+    {
+      lastLat = lat;
+      lastLng = lng;
+
+      sendSMS();
+
+      firstSMSsent = true;
+    }
+    else
+    {
+      if (hasMoved())
+      {
+        Serial.println("Device moved. Sending SMS update");
+        sendSMS();
+      }
+    }
+  }
+
+  while (GSM.available())
+  {
+    Serial.write(GSM.read());
+  }
+}
+
+void uploadThingSpeak()
+{
+  ThingSpeak.setField(1, lat);
+  ThingSpeak.setField(2, lng);
+  ThingSpeak.setField(3, (int)gps.satellites.value());
+
+  int status = ThingSpeak.writeFields(channelID, writeAPIKey);
+
+  Serial.print("ThingSpeak Status: ");
+  Serial.println(status);
+}
+
+void getAddress()
+{
+  if (WiFi.status() == WL_CONNECTED)
+  {
+    HTTPClient http;
+
+    String url = "https://nominatim.openstreetmap.org/reverse?format=json&lat="
+                 + String(lat,6) + "&lon=" + String(lng,6);
+
+    http.begin(url);
+
+    int httpCode = http.GET();
+
+    if (httpCode > 0)
+    {
+      String payload = http.getString();
+
+      DynamicJsonDocument doc(4096);
+
+      DeserializationError error = deserializeJson(doc, payload);
+
+      if (!error)
+      {
+        JsonObject addr = doc["address"];
+
+        String area = addr["suburb"] | addr["village"] | addr["town"] | addr["hamlet"] | "";
+        String city = addr["city"] | addr["county"] | addr["district"] | "";
+        String state = addr["state"] | "";
+        String country = addr["country"] | "";
+        String pincode = addr["postcode"] | "";
+
+        address = area + "," + city + "," + state + "," + country + "," + pincode;
+      }
+    }
+
+    http.end();
+  }
+}
+
+void sendSMS()
+{
+  Serial.println("Sending Live Tracking SMS");
+
+  GSM.println("AT+CMGF=1");
+  delay(1000);
+
+  for(int i=0;i<totalNumbers;i++)
+  {
+    GSM.print("AT+CMGS=\"");
+    GSM.print(phoneNumbers[i]);
+    GSM.println("\"");
+
+    delay(1000);
+
+    GSM.print("Live Tracking Update\n\n");
+
+    GSM.print("Address:\n");
+    GSM.print(address);
+
+    GSM.print("\n\n");
+
+    GSM.print("Map:\n");
+    GSM.print("https://www.google.com/maps?q=");
+    GSM.print(lat,6);
+    GSM.print(",");
+    GSM.print(lng,6);
+
+    GSM.write(26);
+
+    delay(6000);
+  }
+}
+
+void sendEmergencySMS()
+{
+  Serial.println("Sending Emergency SMS");
+
+  GSM.println("AT+CMGF=1");
+  delay(1000);
+
+  for(int i=0;i<totalNumbers;i++)
+  {
+    GSM.print("AT+CMGS=\"");
+    GSM.print(phoneNumbers[i]);
+    GSM.println("\"");
+
+    delay(1000);
+
+    GSM.print("EMERGENCY ALERT!\n");
+    GSM.print("Immediate help required\n\n");
+
+    GSM.print("Last Known Address:\n");
+    GSM.print(address);
+
+    GSM.print("\n\n");
+
+    GSM.print("Map:\n");
+    GSM.print("https://www.google.com/maps?q=");
+    GSM.print(lat,6);
+    GSM.print(",");
+    GSM.print(lng,6);
+
+    GSM.write(26);
+
+    delay(6000);
+  }
+}
